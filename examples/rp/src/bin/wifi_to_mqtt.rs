@@ -5,21 +5,25 @@
 #![no_main]
 #![allow(async_fn_in_trait)]
 
-use core::str::from_utf8;
-
+use heapless::String;
 use cyw43_pio::PioSpi;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
-use embassy_net::{Config, Stack, StackResources};
+use embassy_net::{Config, Stack, StackResources, Ipv4Address};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_time::{Duration, Timer};
-use embedded_io_async::Write;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
+
+use rust_mqtt::{
+    client::{client::MqttClient, client_config::ClientConfig},
+    packet::v5::reason_codes::ReasonCode,
+    utils::rng_generator::CountingRng,
+};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -112,44 +116,67 @@ async fn main(spawner: Spawner) {
 
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
-    let mut buf = [0; 4096];
+
+    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+    socket.set_timeout(Some(Duration::from_secs(10)));
+
+    let remote_endpoint = (Ipv4Address::new(127, 0, 0, 1), 1883);
+    println!("connecting...");
+    let connection = socket.connect(remote_endpoint).await;
+    if let Err(e) = connection {
+        println!("connect error: {:?}", e);
+    }
+    println!("connected!");
+
+    let mut config = ClientConfig::new(
+        rust_mqtt::client::client_config::MqttVersion::MQTTv5,
+        CountingRng(20000),
+    );
+    config.add_max_subscribe_qos(rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1);
+    // config.add_client_id("clientId-8rhWgBODCl");
+    config.max_packet_size = 100;
+    let mut recv_buffer = [0; 80];
+    let mut write_buffer = [0; 80];
+
+    let mut client = MqttClient::<_, 5, _>::new(socket, &mut write_buffer, 80, &mut recv_buffer, 80, config);
+
+    match client.connect_to_broker().await {
+        Ok(()) => {}
+        Err(mqtt_error) => match mqtt_error {
+            ReasonCode::NetworkError => {
+                println!("MQTT Network Error");
+            }
+            _ => {
+                println!("Other MQTT Error");
+            }
+        },
+    }
 
     loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(Duration::from_secs(10)));
-
-        control.gpio_set(0, false).await;
-        info!("Listening on TCP:1234...");
-        if let Err(e) = socket.accept(1234).await {
-            warn!("accept error: {:?}", e);
-            continue;
+        Timer::after(Duration::from_millis(1_000)).await;
+        let temperature_string: String<32> = String::new();
+        
+        match client
+            .send_message(
+                "temperature/1",
+                temperature_string.as_bytes(),
+                rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
+                true,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(mqtt_error) => match mqtt_error {
+                ReasonCode::NetworkError => {
+                    println!("MQTT Network Error");
+                    continue;
+                }
+                _ => {
+                    println!("Other MQTT Error");
+                    continue;
+                }
+            },
         }
-
-        info!("Received connection from {:?}", socket.remote_endpoint());
-        control.gpio_set(0, true).await;
-
-        loop {
-            let n = match socket.read(&mut buf).await {
-                Ok(0) => {
-                    warn!("read EOF");
-                    break;
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    warn!("read error: {:?}", e);
-                    break;
-                }
-            };
-
-            info!("rxd {}", from_utf8(&buf[..n]).unwrap());
-
-            match socket.write_all(&buf[..n]).await {
-                Ok(()) => {}
-                Err(e) => {
-                    warn!("write error: {:?}", e);
-                    break;
-                }
-            };
-        }
+        Timer::after(Duration::from_millis(3000)).await;
     }
 }

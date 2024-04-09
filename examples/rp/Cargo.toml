@@ -19,6 +19,9 @@ embassy-usb-logger = { version = "0.1.0", path = "../../embassy-usb-logger" }
 cyw43 = { version = "0.1.0", path = "../../cyw43", features = ["defmt", "firmware-logs"] }
 cyw43-pio = { version = "0.1.0", path = "../../cyw43-pio", features = ["defmt", "overclock"] }
 
+reqwless = { version = "0.11", default-features = false, features = ["defmt"] }
+rust-mqtt = { version = "0.3.0", default-features = false }
+
 defmt = "0.3"
 defmt-rtt = "0.4"
 fixed = "1.23.1"

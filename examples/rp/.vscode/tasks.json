@@ -1,0 +1,47 @@
+{
+  "version": "0.2.0",
+  "tasks": [
+    {
+      "label": "cargo run wifi_blinky",
+      "type": "cargo",
+      "command": "run",
+      "args": [
+        "--bin",
+        "wifi_blinky",
+        // "arg1"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "cargo run wifi_tcp_server",
+      "type": "cargo",
+      "command": "run",
+      "args": [
+        "--bin",
+        "wifi_tcp_server",
+        // "arg1"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "cargo run wifi_to_mqtt",
+      "type": "cargo",
+      "command": "run",
+      "args": [
+        "--bin",
+        "wifi_to_mqtt",
+        // "arg1"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    }
+  ]
+}
