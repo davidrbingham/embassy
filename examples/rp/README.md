@@ -24,3 +24,7 @@ Make sure you are connected to the router you are testing with as this will chan
 ipconfig getifaddr en0
 192.168.1.180
 ```
+
+## DHT Sensor
+
+https://github.com/michaelbeaumont/dht-sensor

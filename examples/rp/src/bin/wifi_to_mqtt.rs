@@ -5,14 +5,14 @@
 #![no_main]
 #![allow(async_fn_in_trait)]
 
-use heapless::String;
 use cyw43_pio::PioSpi;
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_rp::adc::Adc;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{Config, Stack, StackResources, Ipv4Address};
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{Level, Output};
+use embassy_rp::gpio::{Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_time::{Duration, Timer};
@@ -27,6 +27,7 @@ use rust_mqtt::{
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
+    ADC_IRQ_FIFO => embassy_rp::adc::InterruptHandler;
 });
 
 const WIFI_NETWORK: &str = "TP-Link_71D9";
@@ -200,14 +201,34 @@ async fn main(spawner: Spawner) {
         Err(mqtt_error) => handle_mqtt_error(mqtt_error),
     }
 
+    // Get data from the temp and humidity sensor
+    let mut adc = Adc::new(p.ADC, Irqs, embassy_rp::adc::Config::default());
+    let mut p27 = embassy_rp::adc::Channel::new_pin(p.PIN_27, Pull::None);
+    let mut ts = embassy_rp::adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
+    fn convert_to_celsius(raw_temp: u16) -> f32 {
+        // According to chapter 4.9.5. Temperature Sensor in RP2040 datasheet
+        let temp = 27.0 - (raw_temp as f32 * 3.3 / 4096.0 - 0.706) / 0.001721;
+        let sign = if temp < 0.0 { -1.0 } else { 1.0 };
+        let rounded_temp_x10: i16 = ((temp * 10.0) + 0.5 * sign) as i16;
+        (rounded_temp_x10 as f32) / 10.0
+    }
+
     loop {
         Timer::after(Duration::from_millis(1_000)).await;
-        let temperature_string = "Hello World";
+
+        let level = adc.read(&mut p27).await.unwrap();
+        info!("Pin 26: {} raw", level);
+        let temp = adc.read(&mut ts).await.unwrap();
+        info!("Temp: {} degrees", convert_to_celsius(temp));
         
+        fn u16_to_bytes<'b>(value: u16) -> &'b [u8; 2] {
+            let bytes = value.to_ne_bytes();
+            unsafe { &*(bytes.as_ptr() as *const [u8; 2]) }
+        }
         match client
             .send_message(
                 "temperature/1",
-                temperature_string.as_bytes(),
+                u16_to_bytes(temp),
                 rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
                 true,
             )
