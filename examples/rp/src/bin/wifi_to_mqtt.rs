@@ -44,6 +44,7 @@ async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    
     info!("Hello World!");
 
     let p = embassy_rp::init(Default::default());
@@ -120,7 +121,8 @@ async fn main(spawner: Spawner) {
     let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
     socket.set_timeout(Some(Duration::from_secs(10)));
 
-    let remote_endpoint = (Ipv4Address::new(127, 0, 0, 1), 1883);
+    // TODO Set the IP Address of the machine running Docker with Mosquitto image - 192.168.1.180
+    let remote_endpoint = (Ipv4Address::new(192, 168, 1, 180), 1883);
     println!("connecting...");
     let connection = socket.connect(remote_endpoint).await;
     if let Err(e) = connection {
@@ -140,21 +142,67 @@ async fn main(spawner: Spawner) {
 
     let mut client = MqttClient::<_, 5, _>::new(socket, &mut write_buffer, 80, &mut recv_buffer, 80, config);
 
+    fn handle_mqtt_error(mqtt_error: ReasonCode) {
+        match mqtt_error {
+            ReasonCode::Success => println!("Operation was successful!"),
+            ReasonCode::GrantedQoS1 => println!("Granted QoS level 1!"),
+            ReasonCode::GrantedQoS2 => println!("Granted QoS level 2!"),
+            ReasonCode::DisconnectWithWillMessage => println!("Disconnected with Will message!"),
+            ReasonCode::NoMatchingSubscribers => println!("No matching subscribers on broker!"),
+            ReasonCode::NoSubscriptionExisted => println!("Subscription not exist!"),
+            ReasonCode::ContinueAuth => println!("Broker asks for more AUTH packets!"),
+            ReasonCode::ReAuthenticate => println!("Broker requires re-authentication!"),
+            ReasonCode::UnspecifiedError => println!("Unspecified error!"),
+            ReasonCode::MalformedPacket => println!("Malformed packet sent!"),
+            ReasonCode::ProtocolError => println!("Protocol specific error!"),
+            ReasonCode::ImplementationSpecificError => println!("Implementation specific error!"),
+            ReasonCode::UnsupportedProtocolVersion => println!("Unsupported protocol version!"),
+            ReasonCode::ClientIdNotValid => println!("Client sent not valid identification"),
+            ReasonCode::BadUserNameOrPassword => {
+                println!("Authentication error, username of password not valid!")
+            }
+            ReasonCode::NotAuthorized => println!("Client not authorized!"),
+            ReasonCode::ServerUnavailable => println!("Server unavailable!"),
+            ReasonCode::ServerBusy => println!("Server is busy!"),
+            ReasonCode::Banned => println!("Client is banned on broker!"),
+            ReasonCode::ServerShuttingDown => println!("Server is shutting down!"),
+            ReasonCode::BadAuthMethod => println!("Provided bad authentication method!"),
+            ReasonCode::KeepAliveTimeout => println!("Client reached timeout"),
+            ReasonCode::SessionTakeOver => println!("Took over session!"),
+            ReasonCode::TopicFilterInvalid => println!("Topic filter is not valid!"),
+            ReasonCode::TopicNameInvalid => println!("Topic name is not valid!"),
+            ReasonCode::PacketIdentifierInUse => println!("Packet identifier is already in use!"),
+            ReasonCode::PacketIdentifierNotFound => println!("Packet identifier not found!"),
+            ReasonCode::ReceiveMaximumExceeded => println!("Maximum receive amount exceeded!"),
+            ReasonCode::TopicAliasInvalid => println!("Invalid topic alias!"),
+            ReasonCode::PacketTooLarge => println!("Sent packet was too large!"),
+            ReasonCode::MessageRateTooHigh => println!("Message rate is too high!"),
+            ReasonCode::QuotaExceeded => println!("Quota exceeded!"),
+            ReasonCode::AdministrativeAction => println!("Administrative action!"),
+            ReasonCode::PayloadFormatInvalid => println!("Invalid payload format!"),
+            ReasonCode::RetainNotSupported => println!("Message retain not supported!"),
+            ReasonCode::QoSNotSupported => println!("Used QoS is not supported!"),
+            ReasonCode::UseAnotherServer => println!("Use another server!"),
+            ReasonCode::ServerMoved => println!("Server moved!"),
+            ReasonCode::SharedSubscriptionNotSupported => println!("Shared subscription is not supported"),
+            ReasonCode::ConnectionRateExceeded => println!("Connection rate exceeded!"),
+            ReasonCode::MaximumConnectTime => println!("Maximum connect time exceeded!"),
+            ReasonCode::SubscriptionIdentifiersNotSupported => println!("Subscription identifier not supported!"),
+            ReasonCode::WildcardSubscriptionNotSupported => println!("Wildcard subscription not supported!"),
+            ReasonCode::TimerNotSupported => println!("Timer implementation is not provided"),
+            ReasonCode::BuffError => println!("Error encountered during write / read from packet"),
+            ReasonCode::NetworkError => println!("Unknown error!"),
+        }
+    }
+
     match client.connect_to_broker().await {
         Ok(()) => {}
-        Err(mqtt_error) => match mqtt_error {
-            ReasonCode::NetworkError => {
-                println!("MQTT Network Error");
-            }
-            _ => {
-                println!("Other MQTT Error");
-            }
-        },
+        Err(mqtt_error) => handle_mqtt_error(mqtt_error),
     }
 
     loop {
         Timer::after(Duration::from_millis(1_000)).await;
-        let temperature_string: String<32> = String::new();
+        let temperature_string = "Hello World";
         
         match client
             .send_message(
@@ -166,17 +214,9 @@ async fn main(spawner: Spawner) {
             .await
         {
             Ok(()) => {}
-            Err(mqtt_error) => match mqtt_error {
-                ReasonCode::NetworkError => {
-                    println!("MQTT Network Error");
-                    continue;
-                }
-                _ => {
-                    println!("Other MQTT Error");
-                    continue;
-                }
-            },
+            Err(mqtt_error) => handle_mqtt_error(mqtt_error),
         }
         Timer::after(Duration::from_millis(3000)).await;
     }
 }
+

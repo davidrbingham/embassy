@@ -25,7 +25,7 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
 });
 
-const WIFI_NETWORK: &str = "TP-Link_71D9";
+const WIFI_NETWORK: &str = "TP-Link_71D9_5G";
 const WIFI_PASSWORD: &str = "xxx";
 
 #[embassy_executor::task]
