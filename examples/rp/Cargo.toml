@@ -52,6 +52,7 @@ log = "0.4"
 pio-proc = "0.2"
 pio = "0.2.1"
 rand = { version = "0.8.5", default-features = false }
+p256 = { version = "0.13.2", default-features = false, features = ["pkcs8", "arithmetic", "ecdsa"]}
 
 [profile.release]
 debug = 2

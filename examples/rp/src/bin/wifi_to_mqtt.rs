@@ -16,6 +16,7 @@ use embassy_rp::gpio::{Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_time::{Duration, Timer};
+use p256::elliptic_curve::generic_array::GenericArray;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -25,13 +26,26 @@ use rust_mqtt::{
     utils::rng_generator::CountingRng,
 };
 
+use p256::{
+    pkcs8::{DecodePrivateKey},
+};
+
+use p256::{
+    ecdsa::{SigningKey, VerifyingKey},
+    SecretKey,
+};
+
+use p256::ecdsa::signature::Verifier;
+
+use heapless::Vec;
+
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
     ADC_IRQ_FIFO => embassy_rp::adc::InterruptHandler;
 });
 
 const WIFI_NETWORK: &str = "TP-Link_71D9";
-const WIFI_PASSWORD: &str = "xxx";
+const WIFI_PASSWORD: &str = "05794706";
 
 #[embassy_executor::task]
 async fn wifi_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>) -> ! {
@@ -45,7 +59,17 @@ async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    
+
+    let (signing_key, public_key) = load_keys_from_der();
+    let mqtt_message = b"Hello, MQTT!";
+    let (signature, v) = sign_message(&signing_key, &mqtt_message[..]);
+    let is_valid_signature = verify_signature(&public_key, &mqtt_message[..], signature, v);
+    if is_valid_signature {
+        info!("Signature is valid!");
+    } else {
+        info!("Signature is invalid!");
+    }
+
     info!("Hello World!");
 
     let p = embassy_rp::init(Default::default());
@@ -123,7 +147,7 @@ async fn main(spawner: Spawner) {
     socket.set_timeout(Some(Duration::from_secs(10)));
 
     // TODO Set the IP Address of the machine running Docker with Mosquitto image - 192.168.1.180
-    let remote_endpoint = (Ipv4Address::new(192, 168, 1, 180), 1883);
+    let remote_endpoint = (Ipv4Address::new(192, 168, 1, 181), 1883);
     println!("connecting...");
     let connection = socket.connect(remote_endpoint).await;
     if let Err(e) = connection {
@@ -225,10 +249,40 @@ async fn main(spawner: Spawner) {
             let bytes = value.to_ne_bytes();
             unsafe { &*(bytes.as_ptr() as *const [u8; 2]) }
         }
+        let mqtt_message_temp = b"Temperature received from Pi Pico: ";
+        let temperature_bytes = temp.to_le_bytes();
+        let mut mqtt_message_temp_with_temp: Vec<u8, 128> = Vec::new();
+        mqtt_message_temp_with_temp.extend_from_slice(mqtt_message_temp);
+        mqtt_message_temp_with_temp.extend_from_slice(&temperature_bytes);
+        let (signature, v) = sign_message(&signing_key, &mqtt_message_temp_with_temp[..]);
+        
+        fn create_message(signature: &[u8], message: &[u8]) -> Vec<u8, 128> {
+            let mqtt_message_delimiter = b"####";
+            // Create a new vector to hold the concatenated bytes
+            let mut combined_message: Vec<u8, 128> = Vec::new();
+        
+            // Append the signature bytes to the combined message
+            combined_message.extend_from_slice(signature);
+            combined_message.extend_from_slice(mqtt_message_delimiter);
+            // Append the message bytes to the combined message
+            combined_message.extend_from_slice(message);
+        
+            // Return a reference to the combined message
+            combined_message
+        }
+
+        // Create the combined message
+        let combined_message = create_message(&signature, &mqtt_message_temp_with_temp);
+
+        // Convert the combined message vector to a slice
+        let combined_message_slice: &[u8] = combined_message.as_slice();
+
+        info!("MQTT Message as byte array {:?}", combined_message_slice);
+
         match client
             .send_message(
                 "temperature/1",
-                u16_to_bytes(temp),
+                combined_message_slice,
                 rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
                 true,
             )
@@ -241,3 +295,34 @@ async fn main(spawner: Spawner) {
     }
 }
 
+fn load_keys_from_der() -> (SigningKey, VerifyingKey) {
+    // Load the private key from DER-encoded data
+    let private_key_der = include_bytes!("examples/pkcs8-private-key.der");
+    let private_key = SecretKey::from_pkcs8_der(private_key_der).unwrap();
+    // Convert the private key to a signing key
+    let signing_key = SigningKey::from(private_key);
+    // Extract the corresponding public key from the private key
+    let public_key = VerifyingKey::from(&signing_key);
+    (signing_key, public_key)
+}
+
+fn sign_message(signing_key: &SigningKey, message: &[u8]) -> ([u8; 64], u8) {
+    // Sign the message using the signing key
+    let (signature, v) = signing_key.sign_recoverable(message).unwrap();
+    // Serialize the recoverable signature to a compact format
+    let compact_signature = signature.to_bytes();
+    // Convert RecoveryId to u8
+    let recovery_id_u8: u8 = v.into();
+    // Convert GenericArray<u8> to [u8; 64]
+    let mut signature_array = [0u8; 64];
+    signature_array.copy_from_slice(compact_signature.as_slice());
+    (signature_array, recovery_id_u8)
+}
+
+fn verify_signature(public_key: &VerifyingKey, message: &[u8], signature: [u8; 64], _v: u8) -> bool {
+    // Create a Signature from the signature bytes
+    let sig = p256::ecdsa::Signature::from_bytes(GenericArray::from_slice(&signature)).unwrap();
+
+    // Verify the signature using the public key
+    public_key.verify(message, &sig).is_ok()
+}

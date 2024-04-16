@@ -28,3 +28,48 @@ ipconfig getifaddr en0
 ## DHT Sensor
 
 https://github.com/michaelbeaumont/dht-sensor
+
+
+## Install Docker on Raspberry Pi 4 64bit
+
+sudo apt-get update
+sudo apt-get install ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+
+sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+davidbingham@raspberrypi:~ $ docker --version
+Docker version 26.0.1, build d260a54
+
+sudo apt-get update
+sudo apt-get install docker-compose
+
+## Install Git on Raspberry Pi 4 64bit
+
+sudo apt-get update
+sudo apt-get install git-all
+git version
+
+git clone https://github.com/davidrbingham/mqtt.git
+Use personal access token as the password
+
+## Run docker compose from the command line
+
+cd /workspaces/mqtt/docker
+sudo docker-compose -f docker-compose.yaml up
+
+## Setting up Raspberry Pi Wi-Fi Command Line
+
+nmcli dev wifi list
+sudo nmcli radio wifi on
+sudo nmcli dev wifi connect TP-Link_71D9 password "05794706"
+https://forums.raspberrypi.com/viewtopic.php?t=360175
+/etc/NetworkManager/system-connections/
