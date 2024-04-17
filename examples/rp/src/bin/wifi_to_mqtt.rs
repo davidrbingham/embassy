@@ -16,7 +16,7 @@ use embassy_rp::gpio::{Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_time::{Duration, Timer};
-use p256::elliptic_curve::generic_array::GenericArray;
+use p256::NistP256;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -27,17 +27,16 @@ use rust_mqtt::{
 };
 
 use p256::{
-    pkcs8::{DecodePrivateKey},
-};
-
-use p256::{
+    pkcs8::DecodePrivateKey,
     ecdsa::{SigningKey, VerifyingKey},
+    ecdsa::signature::Verifier,
+    elliptic_curve::generic_array::GenericArray,
     SecretKey,
 };
 
-use p256::ecdsa::signature::Verifier;
+use blake2::{Blake2s256, Digest};
 
-use heapless::Vec;
+use heapless::{Vec, String};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -59,30 +58,12 @@ async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-
-    let (signing_key, public_key) = load_keys_from_der();
-    let mqtt_message = b"Hello, MQTT!";
-    let (signature, v) = sign_message(&signing_key, &mqtt_message[..]);
-    let is_valid_signature = verify_signature(&public_key, &mqtt_message[..], signature, v);
-    if is_valid_signature {
-        info!("Signature is valid!");
-    } else {
-        info!("Signature is invalid!");
-    }
-
-    info!("Hello World!");
+    info!("Hello World from Pi Pico to MQTT for COM771!");
 
     let p = embassy_rp::init(Default::default());
 
     let fw = include_bytes!("../../../../cyw43-firmware/43439A0.bin");
     let clm = include_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
-
-    // To make flashing faster for development, you may want to flash the firmwares independently
-    // at hardcoded addresses, instead of baking them into the program with `include_bytes!`:
-    //     probe-rs download 43439A0.bin --format bin --chip RP2040 --base-address 0x10100000
-    //     probe-rs download 43439A0_clm.bin --format bin --chip RP2040 --base-address 0x10140000
-    //let fw = unsafe { core::slice::from_raw_parts(0x10100000 as *const u8, 230321) };
-    //let clm = unsafe { core::slice::from_raw_parts(0x10140000 as *const u8, 4752) };
 
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
@@ -100,16 +81,8 @@ async fn main(spawner: Spawner) {
         .await;
 
     let config = Config::dhcpv4(Default::default());
-    //let config = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
-    //    address: Ipv4Cidr::new(Ipv4Address::new(192, 168, 69, 2), 24),
-    //    dns_servers: Vec::new(),
-    //    gateway: Some(Ipv4Address::new(192, 168, 69, 1)),
-    //});
+    let seed = 0x0123_4567_89ab_cdef;
 
-    // Generate random seed
-    let seed = 0x0123_4567_89ab_cdef; // chosen by fair dice roll. guarenteed to be random.
-
-    // Init network stack
     static STACK: StaticCell<Stack<cyw43::NetDriver<'static>>> = StaticCell::new();
     static RESOURCES: StaticCell<StackResources<2>> = StaticCell::new();
     let stack = &*STACK.init(Stack::new(
@@ -122,7 +95,6 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(net_task(stack)));
 
     loop {
-        //control.join_open(WIFI_NETWORK).await;
         match control.join_wpa2(WIFI_NETWORK, WIFI_PASSWORD).await {
             Ok(_) => break,
             Err(err) => {
@@ -131,14 +103,11 @@ async fn main(spawner: Spawner) {
         }
     }
 
-    // Wait for DHCP, not necessary when using static IP
     info!("waiting for DHCP...");
     while !stack.is_config_up() {
         Timer::after_millis(100).await;
     }
     info!("DHCP is now up!");
-
-    // And now we can use it!
 
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
@@ -160,72 +129,18 @@ async fn main(spawner: Spawner) {
         CountingRng(20000),
     );
     config.add_max_subscribe_qos(rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1);
-    // config.add_client_id("clientId-8rhWgBODCl");
-    config.max_packet_size = 100;
-    let mut recv_buffer = [0; 80];
-    let mut write_buffer = [0; 80];
+    config.add_client_id("clientId-pi-pico-w");
+    config.max_packet_size = 200;
+    let mut recv_buffer = [0; 200];
+    let mut write_buffer = [0; 200];
 
-    let mut client = MqttClient::<_, 5, _>::new(socket, &mut write_buffer, 80, &mut recv_buffer, 80, config);
-
-    fn handle_mqtt_error(mqtt_error: ReasonCode) {
-        match mqtt_error {
-            ReasonCode::Success => println!("Operation was successful!"),
-            ReasonCode::GrantedQoS1 => println!("Granted QoS level 1!"),
-            ReasonCode::GrantedQoS2 => println!("Granted QoS level 2!"),
-            ReasonCode::DisconnectWithWillMessage => println!("Disconnected with Will message!"),
-            ReasonCode::NoMatchingSubscribers => println!("No matching subscribers on broker!"),
-            ReasonCode::NoSubscriptionExisted => println!("Subscription not exist!"),
-            ReasonCode::ContinueAuth => println!("Broker asks for more AUTH packets!"),
-            ReasonCode::ReAuthenticate => println!("Broker requires re-authentication!"),
-            ReasonCode::UnspecifiedError => println!("Unspecified error!"),
-            ReasonCode::MalformedPacket => println!("Malformed packet sent!"),
-            ReasonCode::ProtocolError => println!("Protocol specific error!"),
-            ReasonCode::ImplementationSpecificError => println!("Implementation specific error!"),
-            ReasonCode::UnsupportedProtocolVersion => println!("Unsupported protocol version!"),
-            ReasonCode::ClientIdNotValid => println!("Client sent not valid identification"),
-            ReasonCode::BadUserNameOrPassword => {
-                println!("Authentication error, username of password not valid!")
-            }
-            ReasonCode::NotAuthorized => println!("Client not authorized!"),
-            ReasonCode::ServerUnavailable => println!("Server unavailable!"),
-            ReasonCode::ServerBusy => println!("Server is busy!"),
-            ReasonCode::Banned => println!("Client is banned on broker!"),
-            ReasonCode::ServerShuttingDown => println!("Server is shutting down!"),
-            ReasonCode::BadAuthMethod => println!("Provided bad authentication method!"),
-            ReasonCode::KeepAliveTimeout => println!("Client reached timeout"),
-            ReasonCode::SessionTakeOver => println!("Took over session!"),
-            ReasonCode::TopicFilterInvalid => println!("Topic filter is not valid!"),
-            ReasonCode::TopicNameInvalid => println!("Topic name is not valid!"),
-            ReasonCode::PacketIdentifierInUse => println!("Packet identifier is already in use!"),
-            ReasonCode::PacketIdentifierNotFound => println!("Packet identifier not found!"),
-            ReasonCode::ReceiveMaximumExceeded => println!("Maximum receive amount exceeded!"),
-            ReasonCode::TopicAliasInvalid => println!("Invalid topic alias!"),
-            ReasonCode::PacketTooLarge => println!("Sent packet was too large!"),
-            ReasonCode::MessageRateTooHigh => println!("Message rate is too high!"),
-            ReasonCode::QuotaExceeded => println!("Quota exceeded!"),
-            ReasonCode::AdministrativeAction => println!("Administrative action!"),
-            ReasonCode::PayloadFormatInvalid => println!("Invalid payload format!"),
-            ReasonCode::RetainNotSupported => println!("Message retain not supported!"),
-            ReasonCode::QoSNotSupported => println!("Used QoS is not supported!"),
-            ReasonCode::UseAnotherServer => println!("Use another server!"),
-            ReasonCode::ServerMoved => println!("Server moved!"),
-            ReasonCode::SharedSubscriptionNotSupported => println!("Shared subscription is not supported"),
-            ReasonCode::ConnectionRateExceeded => println!("Connection rate exceeded!"),
-            ReasonCode::MaximumConnectTime => println!("Maximum connect time exceeded!"),
-            ReasonCode::SubscriptionIdentifiersNotSupported => println!("Subscription identifier not supported!"),
-            ReasonCode::WildcardSubscriptionNotSupported => println!("Wildcard subscription not supported!"),
-            ReasonCode::TimerNotSupported => println!("Timer implementation is not provided"),
-            ReasonCode::BuffError => println!("Error encountered during write / read from packet"),
-            ReasonCode::NetworkError => println!("Unknown error!"),
-        }
-    }
+    let mut client = MqttClient::<_, 5, _>::new(socket, &mut write_buffer, 200, &mut recv_buffer, 200, config);
 
     match client.connect_to_broker().await {
         Ok(()) => {}
         Err(mqtt_error) => handle_mqtt_error(mqtt_error),
     }
 
-    // Get data from the temp and humidity sensor
     let mut adc = Adc::new(p.ADC, Irqs, embassy_rp::adc::Config::default());
     let mut p27 = embassy_rp::adc::Channel::new_pin(p.PIN_27, Pull::None);
     let mut ts = embassy_rp::adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
@@ -237,52 +152,71 @@ async fn main(spawner: Spawner) {
         (rounded_temp_x10 as f32) / 10.0
     }
 
-    loop {
-        Timer::after(Duration::from_millis(1_000)).await;
+    let signing_key = get_ecc_p256_signing_key_from_der();
 
+    loop {
         let level = adc.read(&mut p27).await.unwrap();
         info!("Pin 26: {} raw", level);
         let temp = adc.read(&mut ts).await.unwrap();
-        info!("Temp: {} degrees", convert_to_celsius(temp));
-        
-        fn u16_to_bytes<'b>(value: u16) -> &'b [u8; 2] {
-            let bytes = value.to_ne_bytes();
-            unsafe { &*(bytes.as_ptr() as *const [u8; 2]) }
+        let temp_celsius = convert_to_celsius(temp);
+        info!("Temp: {} degrees", &temp_celsius);
+
+        let mut message_data = String::<50>::new();
+        if let Ok(_) = core::fmt::write(&mut message_data, format_args!("Temperature received from Pi Pico: {:.1} degrees", &temp_celsius)) {
+            info!("Raw message to MQTT: {}", message_data);            
+        } else {
+            error!("Failed to write to the MQTT string!");
+            continue;
         }
-        let mqtt_message_temp = b"Temperature received from Pi Pico: ";
-        let temperature_bytes = temp.to_le_bytes();
-        let mut mqtt_message_temp_with_temp: Vec<u8, 128> = Vec::new();
-        mqtt_message_temp_with_temp.extend_from_slice(mqtt_message_temp);
-        mqtt_message_temp_with_temp.extend_from_slice(&temperature_bytes);
-        let (signature, v) = sign_message(&signing_key, &mqtt_message_temp_with_temp[..]);
-        
+
+        let (signature, v) = sign_message(&signing_key, message_data.as_bytes());
         fn create_message(signature: &[u8], message: &[u8]) -> Vec<u8, 128> {
             let mqtt_message_delimiter = b"####";
-            // Create a new vector to hold the concatenated bytes
             let mut combined_message: Vec<u8, 128> = Vec::new();
         
-            // Append the signature bytes to the combined message
             combined_message.extend_from_slice(signature);
             combined_message.extend_from_slice(mqtt_message_delimiter);
-            // Append the message bytes to the combined message
             combined_message.extend_from_slice(message);
         
-            // Return a reference to the combined message
             combined_message
         }
 
-        // Create the combined message
-        let combined_message = create_message(&signature, &mqtt_message_temp_with_temp);
+        let mqtt_signed_raw_message = create_message(&signature, &message_data.as_bytes());
+        let mqtt_signed_raw_message_slice: &[u8] = mqtt_signed_raw_message.as_slice();
 
-        // Convert the combined message vector to a slice
-        let combined_message_slice: &[u8] = combined_message.as_slice();
-
-        info!("MQTT Message as byte array {:?}", combined_message_slice);
+        info!("Raw MQTT Message as byte array {:?}", &mqtt_signed_raw_message_slice);
 
         match client
             .send_message(
                 "temperature/1",
-                combined_message_slice,
+                mqtt_signed_raw_message_slice,
+                rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
+                true,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(mqtt_error) => handle_mqtt_error(mqtt_error),
+        }
+
+        let mut hasher = Blake2s256::new();
+        hasher.update(message_data.as_bytes());
+        let hashed_message = hasher.finalize();
+
+        let mut hashed_message_bytes = [0u8; 32];
+        hashed_message_bytes.copy_from_slice(hashed_message.as_slice());
+
+        let (signature, v) = sign_message(&signing_key, &hashed_message_bytes);
+
+        let mqtt_signed_hashed_message = create_message(&signature, &hashed_message_bytes);
+        let mqtt_signed_hashed_message_slice: &[u8] = mqtt_signed_hashed_message.as_slice();
+
+        info!("Hashed MQTT Message as byte array {:?}", &mqtt_signed_hashed_message_slice);
+
+        match client
+            .send_message(
+                "temperature/2",
+                mqtt_signed_hashed_message_slice,
                 rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
                 true,
             )
@@ -295,34 +229,92 @@ async fn main(spawner: Spawner) {
     }
 }
 
+fn handle_mqtt_error(mqtt_error: ReasonCode) {
+    match mqtt_error {
+        ReasonCode::Success => println!("Operation was successful!"),
+        ReasonCode::GrantedQoS1 => println!("Granted QoS level 1!"),
+        ReasonCode::GrantedQoS2 => println!("Granted QoS level 2!"),
+        ReasonCode::DisconnectWithWillMessage => println!("Disconnected with Will message!"),
+        ReasonCode::NoMatchingSubscribers => println!("No matching subscribers on broker!"),
+        ReasonCode::NoSubscriptionExisted => println!("Subscription not exist!"),
+        ReasonCode::ContinueAuth => println!("Broker asks for more AUTH packets!"),
+        ReasonCode::ReAuthenticate => println!("Broker requires re-authentication!"),
+        ReasonCode::UnspecifiedError => println!("Unspecified error!"),
+        ReasonCode::MalformedPacket => println!("Malformed packet sent!"),
+        ReasonCode::ProtocolError => println!("Protocol specific error!"),
+        ReasonCode::ImplementationSpecificError => println!("Implementation specific error!"),
+        ReasonCode::UnsupportedProtocolVersion => println!("Unsupported protocol version!"),
+        ReasonCode::ClientIdNotValid => println!("Client sent not valid identification"),
+        ReasonCode::BadUserNameOrPassword => {
+            println!("Authentication error, username of password not valid!")
+        }
+        ReasonCode::NotAuthorized => println!("Client not authorized!"),
+        ReasonCode::ServerUnavailable => println!("Server unavailable!"),
+        ReasonCode::ServerBusy => println!("Server is busy!"),
+        ReasonCode::Banned => println!("Client is banned on broker!"),
+        ReasonCode::ServerShuttingDown => println!("Server is shutting down!"),
+        ReasonCode::BadAuthMethod => println!("Provided bad authentication method!"),
+        ReasonCode::KeepAliveTimeout => println!("Client reached timeout"),
+        ReasonCode::SessionTakeOver => println!("Took over session!"),
+        ReasonCode::TopicFilterInvalid => println!("Topic filter is not valid!"),
+        ReasonCode::TopicNameInvalid => println!("Topic name is not valid!"),
+        ReasonCode::PacketIdentifierInUse => println!("Packet identifier is already in use!"),
+        ReasonCode::PacketIdentifierNotFound => println!("Packet identifier not found!"),
+        ReasonCode::ReceiveMaximumExceeded => println!("Maximum receive amount exceeded!"),
+        ReasonCode::TopicAliasInvalid => println!("Invalid topic alias!"),
+        ReasonCode::PacketTooLarge => println!("Sent packet was too large!"),
+        ReasonCode::MessageRateTooHigh => println!("Message rate is too high!"),
+        ReasonCode::QuotaExceeded => println!("Quota exceeded!"),
+        ReasonCode::AdministrativeAction => println!("Administrative action!"),
+        ReasonCode::PayloadFormatInvalid => println!("Invalid payload format!"),
+        ReasonCode::RetainNotSupported => println!("Message retain not supported!"),
+        ReasonCode::QoSNotSupported => println!("Used QoS is not supported!"),
+        ReasonCode::UseAnotherServer => println!("Use another server!"),
+        ReasonCode::ServerMoved => println!("Server moved!"),
+        ReasonCode::SharedSubscriptionNotSupported => println!("Shared subscription is not supported"),
+        ReasonCode::ConnectionRateExceeded => println!("Connection rate exceeded!"),
+        ReasonCode::MaximumConnectTime => println!("Maximum connect time exceeded!"),
+        ReasonCode::SubscriptionIdentifiersNotSupported => println!("Subscription identifier not supported!"),
+        ReasonCode::WildcardSubscriptionNotSupported => println!("Wildcard subscription not supported!"),
+        ReasonCode::TimerNotSupported => println!("Timer implementation is not provided"),
+        ReasonCode::BuffError => println!("Error encountered during write / read from packet"),
+        ReasonCode::NetworkError => println!("Unknown error!"),
+    }
+}
+
 fn load_keys_from_der() -> (SigningKey, VerifyingKey) {
-    // Load the private key from DER-encoded data
     let private_key_der = include_bytes!("examples/pkcs8-private-key.der");
     let private_key = SecretKey::from_pkcs8_der(private_key_der).unwrap();
-    // Convert the private key to a signing key
     let signing_key = SigningKey::from(private_key);
-    // Extract the corresponding public key from the private key
     let public_key = VerifyingKey::from(&signing_key);
     (signing_key, public_key)
 }
 
 fn sign_message(signing_key: &SigningKey, message: &[u8]) -> ([u8; 64], u8) {
-    // Sign the message using the signing key
     let (signature, v) = signing_key.sign_recoverable(message).unwrap();
-    // Serialize the recoverable signature to a compact format
     let compact_signature = signature.to_bytes();
-    // Convert RecoveryId to u8
     let recovery_id_u8: u8 = v.into();
-    // Convert GenericArray<u8> to [u8; 64]
     let mut signature_array = [0u8; 64];
     signature_array.copy_from_slice(compact_signature.as_slice());
     (signature_array, recovery_id_u8)
 }
 
 fn verify_signature(public_key: &VerifyingKey, message: &[u8], signature: [u8; 64], _v: u8) -> bool {
-    // Create a Signature from the signature bytes
     let sig = p256::ecdsa::Signature::from_bytes(GenericArray::from_slice(&signature)).unwrap();
-
-    // Verify the signature using the public key
     public_key.verify(message, &sig).is_ok()
+}
+
+fn get_ecc_p256_signing_key_from_der() -> SigningKey {
+    let (signing_key, public_key) = load_keys_from_der();
+    let mqtt_message = b"Hello world, MQTT!";
+
+    // This is a test to ensure the flow actually works, but shouln't really be in this method!
+    let (signature, v) = sign_message(&signing_key, &mqtt_message[..]);
+    let is_valid_signature = verify_signature(&public_key, &mqtt_message[..], signature, v);
+    if is_valid_signature {
+        info!("Signature is valid!");
+    } else {
+        info!("Signature is invalid!");
+    }
+    signing_key
 }
