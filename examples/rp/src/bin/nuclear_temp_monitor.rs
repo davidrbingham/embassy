@@ -1,6 +1,3 @@
-//! This example uses the RP Pico W board Wifi chip (cyw43).
-//! Connects to specified Wifi network and creates a TCP endpoint on port 1234.
-
 #![no_std]
 #![no_main]
 #![allow(async_fn_in_trait)]
@@ -162,15 +159,14 @@ async fn main(spawner: Spawner) {
         info!("Temp: {} degrees", &temp_celsius);
 
         let mut message_data = String::<50>::new();
-        if let Ok(_) = core::fmt::write(&mut message_data, format_args!("Temperature received from Pi Pico: {:.1} degrees", &temp_celsius)) {
+        if let Ok(_) = core::fmt::write(&mut message_data, format_args!("Reactor Core Temperature :: {:.1} °C", &temp_celsius)) {
             info!("Raw message to MQTT: {}", message_data);            
         } else {
             error!("Failed to write to the MQTT string!");
             continue;
         }
 
-        let (signature, v) = sign_message(&signing_key, message_data.as_bytes());
-        fn create_message(signature: &[u8], message: &[u8]) -> Vec<u8, 128> {
+        fn sign_message(signature: &[u8], message: &[u8]) -> Vec<u8, 128> {
             let mqtt_message_delimiter = b"####";
             let mut combined_message: Vec<u8, 128> = Vec::new();
         
@@ -181,14 +177,58 @@ async fn main(spawner: Spawner) {
             combined_message
         }
 
-        let mqtt_signed_raw_message = create_message(&signature, &message_data.as_bytes());
+        let mut hasher = Blake2s256::new();
+        hasher.update(message_data.as_bytes());
+        let hashed_message = hasher.finalize();
+
+        // Message 1: Raw Temperature without ECC or Blake2 Hashing
+
+        match client
+        .send_message(
+            "temperature/1",
+            message_data.as_bytes(),
+            rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
+            true,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(mqtt_error) => handle_mqtt_error(mqtt_error),
+        }
+
+        Timer::after(Duration::from_millis(1000)).await;
+
+        // Message 2: Raw Temperature with Blake2 Hash
+
+        let mqtt_hashed_raw_message = sign_message(&hashed_message, &message_data.as_bytes());
+
+        match client
+        .send_message(
+            "temperature/2",
+            &mqtt_hashed_raw_message,
+            rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
+            true,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(mqtt_error) => handle_mqtt_error(mqtt_error),
+        }
+
+        Timer::after(Duration::from_millis(1000)).await;
+
+        // Message 3: Raw Temperature with ECC Signature generated from raw message text (unhashed)
+
+        let (signature, v) = generate_signature(&signing_key, message_data.as_bytes());
+
+        let mqtt_signed_raw_message = sign_message(&signature, &message_data.as_bytes());
         let mqtt_signed_raw_message_slice: &[u8] = mqtt_signed_raw_message.as_slice();
 
         info!("Raw MQTT Message as byte array {:?}", &mqtt_signed_raw_message_slice);
 
         match client
             .send_message(
-                "temperature/1",
+                "temperature/3",
                 mqtt_signed_raw_message_slice,
                 rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
                 true,
@@ -199,23 +239,23 @@ async fn main(spawner: Spawner) {
             Err(mqtt_error) => handle_mqtt_error(mqtt_error),
         }
 
-        let mut hasher = Blake2s256::new();
-        hasher.update(message_data.as_bytes());
-        let hashed_message = hasher.finalize();
+        Timer::after(Duration::from_millis(1000)).await;
+
+        // Message 4: Raw Temperature with ECC Signature generated after Blake2 hashing of raw message
 
         let mut hashed_message_bytes = [0u8; 32];
         hashed_message_bytes.copy_from_slice(hashed_message.as_slice());
 
-        let (signature, v) = sign_message(&signing_key, &hashed_message_bytes);
+        let (signature, v) = generate_signature(&signing_key, &hashed_message_bytes);
 
-        let mqtt_signed_hashed_message = create_message(&signature, &hashed_message_bytes);
+        let mqtt_signed_hashed_message = sign_message(&signature, &message_data.as_bytes());
         let mqtt_signed_hashed_message_slice: &[u8] = mqtt_signed_hashed_message.as_slice();
 
         info!("Hashed MQTT Message as byte array {:?}", &mqtt_signed_hashed_message_slice);
 
         match client
             .send_message(
-                "temperature/2",
+                "temperature/4",
                 mqtt_signed_hashed_message_slice,
                 rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
                 true,
@@ -225,6 +265,7 @@ async fn main(spawner: Spawner) {
             Ok(()) => {}
             Err(mqtt_error) => handle_mqtt_error(mqtt_error),
         }
+        
         Timer::after(Duration::from_millis(3000)).await;
     }
 }
@@ -283,14 +324,14 @@ fn handle_mqtt_error(mqtt_error: ReasonCode) {
 }
 
 fn load_keys_from_der() -> (SigningKey, VerifyingKey) {
-    let private_key_der = include_bytes!("examples/pkcs8-private-key.der");
+    let private_key_der = include_bytes!("ecc/pkcs8-private-key.der");
     let private_key = SecretKey::from_pkcs8_der(private_key_der).unwrap();
     let signing_key = SigningKey::from(private_key);
     let public_key = VerifyingKey::from(&signing_key);
     (signing_key, public_key)
 }
 
-fn sign_message(signing_key: &SigningKey, message: &[u8]) -> ([u8; 64], u8) {
+fn generate_signature(signing_key: &SigningKey, message: &[u8]) -> ([u8; 64], u8) {
     let (signature, v) = signing_key.sign_recoverable(message).unwrap();
     let compact_signature = signature.to_bytes();
     let recovery_id_u8: u8 = v.into();
@@ -309,7 +350,7 @@ fn get_ecc_p256_signing_key_from_der() -> SigningKey {
     let mqtt_message = b"Hello world, MQTT!";
 
     // This is a test to ensure the flow actually works, but shouln't really be in this method!
-    let (signature, v) = sign_message(&signing_key, &mqtt_message[..]);
+    let (signature, v) = generate_signature(&signing_key, &mqtt_message[..]);
     let is_valid_signature = verify_signature(&public_key, &mqtt_message[..], signature, v);
     if is_valid_signature {
         info!("Signature is valid!");
