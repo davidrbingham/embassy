@@ -248,7 +248,6 @@ async fn main(spawner: Spawner) {
 
         info!("Message 3: Raw MQTT Message {:?}", &message_data);
         info!("Message 3: Signed MQTT Message {:?}", &mqtt_signed_raw_message_slice);
-        info!("Message 3: Hashed ECC Signature r {:?} s {:?}", &r_bytes, &s_bytes);
         info!("Message 3: Raw MQTT Signature as hex string {:?}", &hex_string_from_signature);
 
         match client
@@ -275,9 +274,7 @@ async fn main(spawner: Spawner) {
         let mqtt_signed_hashed_message_slice: &[u8] = mqtt_signed_hashed_raw_message.as_slice();
 
         info!("Message 4: Raw MQTT Message {:?}", &message_data);
-        info!("Message 4: Signed and Hashed MQTT Message Signature {:?}", &hex_string_from_signature);
-        info!("Message 4: Hashed ECC Signature r {:?} s {:?}", &r_bytes, &s_bytes);
-        info!("Message 4: Signed and Hashed MQTT Message {:?}", &mqtt_signed_hashed_message_slice);
+        info!("Message 4: Hex string used to create ECC signature to be matched on Java side {:?}", &hex_string_from_message_hash);
 
         match client
             .send_message(
