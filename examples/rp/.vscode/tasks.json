@@ -34,6 +34,7 @@
       "type": "cargo",
       "command": "run",
       "args": [
+        "--release",
         "--bin",
         "nuclear_temp_monitor",
         // "arg1"

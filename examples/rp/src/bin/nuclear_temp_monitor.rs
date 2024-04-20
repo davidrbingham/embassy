@@ -13,7 +13,7 @@ use embassy_rp::gpio::{Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_time::{Duration, Timer};
-use p256::NistP256;
+use p256::ecdsa::Signature;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -52,6 +52,9 @@ async fn wifi_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'stati
 async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
     stack.run().await
 }
+
+const HEX_STRING_CAPACITY_64: usize = 64; // Blake2s256 hash is 32 bytes, hex is 2x size
+const HEX_STRING_CAPACITY_128: usize = 128; // ECC signature is 64 bytes, hex is 2x size
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -113,13 +116,13 @@ async fn main(spawner: Spawner) {
     socket.set_timeout(Some(Duration::from_secs(10)));
 
     // TODO Set the IP Address of the machine running Docker with Mosquitto image - 192.168.1.180
-    let remote_endpoint = (Ipv4Address::new(192, 168, 1, 181), 1883);
-    println!("connecting...");
+    let remote_endpoint = (Ipv4Address::new(192, 168, 1, 184), 1883);
+    info!("connecting...");
     let connection = socket.connect(remote_endpoint).await;
     if let Err(e) = connection {
-        println!("connect error: {:?}", e);
+        error!("connect error: {:?}", e);
     }
-    println!("connected!");
+    info!("connected!");
 
     let mut config = ClientConfig::new(
         rust_mqtt::client::client_config::MqttVersion::MQTTv5,
@@ -127,11 +130,11 @@ async fn main(spawner: Spawner) {
     );
     config.add_max_subscribe_qos(rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1);
     config.add_client_id("clientId-pi-pico-w");
-    config.max_packet_size = 200;
-    let mut recv_buffer = [0; 200];
-    let mut write_buffer = [0; 200];
+    config.max_packet_size = 300;
+    let mut recv_buffer = [0; 300];
+    let mut write_buffer = [0; 300];
 
-    let mut client = MqttClient::<_, 5, _>::new(socket, &mut write_buffer, 200, &mut recv_buffer, 200, config);
+    let mut client = MqttClient::<_, 5, _>::new(socket, &mut write_buffer, 300, &mut recv_buffer, 300, config);
 
     match client.connect_to_broker().await {
         Ok(()) => {}
@@ -139,7 +142,6 @@ async fn main(spawner: Spawner) {
     }
 
     let mut adc = Adc::new(p.ADC, Irqs, embassy_rp::adc::Config::default());
-    let mut p27 = embassy_rp::adc::Channel::new_pin(p.PIN_27, Pull::None);
     let mut ts = embassy_rp::adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
     fn convert_to_celsius(raw_temp: u16) -> f32 {
         // According to chapter 4.9.5. Temperature Sensor in RP2040 datasheet
@@ -152,8 +154,6 @@ async fn main(spawner: Spawner) {
     let signing_key = get_ecc_p256_signing_key_from_der();
 
     loop {
-        let level = adc.read(&mut p27).await.unwrap();
-        info!("Pin 26: {} raw", level);
         let temp = adc.read(&mut ts).await.unwrap();
         let temp_celsius = convert_to_celsius(temp);
         info!("Temp: {} degrees", &temp_celsius);
@@ -166,14 +166,23 @@ async fn main(spawner: Spawner) {
             continue;
         }
 
-        fn sign_message(signature: &[u8], message: &[u8]) -> Vec<u8, 128> {
+        fn sign_message(signature: &[u8], message: &[u8]) -> Vec<u8, 512> {
             let mqtt_message_delimiter = b"####";
-            let mut combined_message: Vec<u8, 128> = Vec::new();
+            let mut combined_message: Vec<u8, 512> = Vec::new();
         
+            info!("sign_message :: Signature: {:?}", signature);
+            info!("sign_message :: Message delimiter: {:?}", mqtt_message_delimiter);
+            info!("sign_message :: Message: {:?}", message);
+            
             combined_message.extend_from_slice(signature);
+            info!("sign_message :: Combined message after adding signature: {:?}", combined_message);
+            
             combined_message.extend_from_slice(mqtt_message_delimiter);
+            info!("sign_message :: Combined message after adding delimiter: {:?}", combined_message);
+            
             combined_message.extend_from_slice(message);
-        
+            info!("sign_message :: Combined message after adding message: {:?}", combined_message);
+            
             combined_message
         }
 
@@ -181,12 +190,20 @@ async fn main(spawner: Spawner) {
         hasher.update(message_data.as_bytes());
         let hashed_message = hasher.finalize();
 
+        let hex_string_from_message_hash = convert_hash_to_hex_string(hashed_message.as_slice());
+
+        info!("Blake2 Hash from: {}", &message_data); 
+        info!("Blake2 Hash bytes: {}", hashed_message.as_slice());
+        info!("Blake2 Hash hex string: {}", &hex_string_from_message_hash);
+
         // Message 1: Raw Temperature without ECC or Blake2 Hashing
+
+        info!("Message 1: Raw MQTT Message {:?}", &message_data);
 
         match client
         .send_message(
             "temperature/1",
-            message_data.as_bytes(),
+            &message_data.as_bytes(),
             rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
             true,
         )
@@ -200,12 +217,16 @@ async fn main(spawner: Spawner) {
 
         // Message 2: Raw Temperature with Blake2 Hash
 
-        let mqtt_hashed_raw_message = sign_message(&hashed_message, &message_data.as_bytes());
+        let mqtt_hashed_raw_message = sign_message(&hex_string_from_message_hash.as_bytes(), &message_data.as_bytes());
+        let mqtt_hashed_raw_message_slice: &[u8] = mqtt_hashed_raw_message.as_slice();
+
+        info!("Message 2: Raw MQTT Message {:?}", &message_data);
+        info!("Message 2: Hashed MQTT Message {:?}", &mqtt_hashed_raw_message_slice);
 
         match client
         .send_message(
             "temperature/2",
-            &mqtt_hashed_raw_message,
+            mqtt_hashed_raw_message_slice,
             rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
             true,
         )
@@ -219,12 +240,16 @@ async fn main(spawner: Spawner) {
 
         // Message 3: Raw Temperature with ECC Signature generated from raw message text (unhashed)
 
-        let (signature, v) = generate_signature(&signing_key, message_data.as_bytes());
+        let (r_bytes, s_bytes) = generate_signature(&signing_key, &message_data.as_bytes());
+        let hex_string_from_signature = convert_signature_to_hex_string(&r_bytes, &s_bytes);
 
-        let mqtt_signed_raw_message = sign_message(&signature, &message_data.as_bytes());
+        let mqtt_signed_raw_message = sign_message(&hex_string_from_signature.as_bytes(), &message_data.as_bytes());
         let mqtt_signed_raw_message_slice: &[u8] = mqtt_signed_raw_message.as_slice();
 
-        info!("Raw MQTT Message as byte array {:?}", &mqtt_signed_raw_message_slice);
+        info!("Message 3: Raw MQTT Message {:?}", &message_data);
+        info!("Message 3: Signed MQTT Message {:?}", &mqtt_signed_raw_message_slice);
+        info!("Message 3: Hashed ECC Signature r {:?} s {:?}", &r_bytes, &s_bytes);
+        info!("Message 3: Raw MQTT Signature as hex string {:?}", &hex_string_from_signature);
 
         match client
             .send_message(
@@ -243,15 +268,16 @@ async fn main(spawner: Spawner) {
 
         // Message 4: Raw Temperature with ECC Signature generated after Blake2 hashing of raw message
 
-        let mut hashed_message_bytes = [0u8; 32];
-        hashed_message_bytes.copy_from_slice(hashed_message.as_slice());
+        let (r_bytes, s_bytes) = generate_signature(&signing_key, &hex_string_from_message_hash.as_bytes());
+        let hex_string_from_signature = convert_signature_to_hex_string(&r_bytes, &s_bytes);
 
-        let (signature, v) = generate_signature(&signing_key, &hashed_message_bytes);
+        let mqtt_signed_hashed_raw_message = sign_message(&hex_string_from_signature.as_bytes(), &message_data.as_bytes());
+        let mqtt_signed_hashed_message_slice: &[u8] = mqtt_signed_hashed_raw_message.as_slice();
 
-        let mqtt_signed_hashed_message = sign_message(&signature, &message_data.as_bytes());
-        let mqtt_signed_hashed_message_slice: &[u8] = mqtt_signed_hashed_message.as_slice();
-
-        info!("Hashed MQTT Message as byte array {:?}", &mqtt_signed_hashed_message_slice);
+        info!("Message 4: Raw MQTT Message {:?}", &message_data);
+        info!("Message 4: Signed and Hashed MQTT Message Signature {:?}", &hex_string_from_signature);
+        info!("Message 4: Hashed ECC Signature r {:?} s {:?}", &r_bytes, &s_bytes);
+        info!("Message 4: Signed and Hashed MQTT Message {:?}", &mqtt_signed_hashed_message_slice);
 
         match client
             .send_message(
@@ -331,31 +357,73 @@ fn load_keys_from_der() -> (SigningKey, VerifyingKey) {
     (signing_key, public_key)
 }
 
-fn generate_signature(signing_key: &SigningKey, message: &[u8]) -> ([u8; 64], u8) {
+fn generate_signature(signing_key: &SigningKey, message: &[u8]) -> ([u8; 32], [u8; 32]) {
     let (signature, v) = signing_key.sign_recoverable(message).unwrap();
+    
     let compact_signature = signature.to_bytes();
-    let recovery_id_u8: u8 = v.into();
-    let mut signature_array = [0u8; 64];
-    signature_array.copy_from_slice(compact_signature.as_slice());
-    (signature_array, recovery_id_u8)
+    
+    let mut r_bytes = [0u8; 32];
+    let mut s_bytes = [0u8; 32];
+    r_bytes.copy_from_slice(&compact_signature[..32]);
+    s_bytes.copy_from_slice(&compact_signature[32..]);
+    
+    (r_bytes, s_bytes)
 }
 
-fn verify_signature(public_key: &VerifyingKey, message: &[u8], signature: [u8; 64], _v: u8) -> bool {
-    let sig = p256::ecdsa::Signature::from_bytes(GenericArray::from_slice(&signature)).unwrap();
-    public_key.verify(message, &sig).is_ok()
+fn verify_signature(public_key: &VerifyingKey, message: &[u8], r_bytes: [u8; 32], s_bytes: [u8; 32]) -> bool {
+    let mut compact_signature = [0u8; 64];
+    compact_signature[..32].copy_from_slice(&r_bytes);
+    compact_signature[32..].copy_from_slice(&s_bytes);
+    
+    let generic_array_signature = GenericArray::from(compact_signature);
+    
+    let signature = Signature::from_bytes(&generic_array_signature).unwrap();    
+    public_key.verify(message, &signature).is_ok()
 }
 
 fn get_ecc_p256_signing_key_from_der() -> SigningKey {
     let (signing_key, public_key) = load_keys_from_der();
     let mqtt_message = b"Hello world, MQTT!";
-
-    // This is a test to ensure the flow actually works, but shouln't really be in this method!
-    let (signature, v) = generate_signature(&signing_key, &mqtt_message[..]);
-    let is_valid_signature = verify_signature(&public_key, &mqtt_message[..], signature, v);
+    
+    let (r_bytes, s_bytes) = generate_signature(&signing_key, mqtt_message);
+    let is_valid_signature = verify_signature(&public_key, mqtt_message, r_bytes, s_bytes);
+    
     if is_valid_signature {
         info!("Signature is valid!");
     } else {
         info!("Signature is invalid!");
     }
+    
     signing_key
+}
+
+fn convert_hash_to_hex_string(hashed_message: &[u8]) -> heapless::String<HEX_STRING_CAPACITY_64> {
+    let mut hex_string_from_message_hash: heapless::String<HEX_STRING_CAPACITY_64> = heapless::String::new();
+    let mut hex_bytes = [0u8; HEX_STRING_CAPACITY_64];
+    hex::encode_to_slice(hashed_message, &mut hex_bytes).unwrap();
+    let hex_str = unsafe {
+        core::str::from_utf8_unchecked(&hex_bytes)
+    };
+    hex_string_from_message_hash.push_str(hex_str).unwrap();
+    hex_string_from_message_hash
+}
+
+fn convert_signature_to_hex_string(r_bytes: &[u8; 32], s_bytes: &[u8; 32]) -> heapless::String<HEX_STRING_CAPACITY_128> {
+    let mut hex_string_from_signature: heapless::String<HEX_STRING_CAPACITY_128> = heapless::String::new();
+    let mut r_hex_bytes = [0u8; HEX_STRING_CAPACITY_64];
+
+    hex::encode_to_slice(r_bytes, &mut r_hex_bytes).unwrap();
+    let r_hex_str = unsafe {
+        core::str::from_utf8_unchecked(&r_hex_bytes)
+    };
+    hex_string_from_signature.push_str(r_hex_str).unwrap();
+    
+    let mut s_hex_bytes = [0u8; HEX_STRING_CAPACITY_64];
+    hex::encode_to_slice(s_bytes, &mut s_hex_bytes).unwrap();
+    let s_hex_str = unsafe {
+        core::str::from_utf8_unchecked(&s_hex_bytes)
+    };
+    hex_string_from_signature.push_str(s_hex_str).unwrap();
+    
+    hex_string_from_signature
 }
