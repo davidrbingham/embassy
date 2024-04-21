@@ -9,10 +9,10 @@ use embassy_rp::adc::Adc;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{Config, Stack, StackResources, Ipv4Address};
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{Level, Output, Pull};
+use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, Instant, TICK_HZ};
 use p256::ecdsa::Signature;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
@@ -117,12 +117,12 @@ async fn main(spawner: Spawner) {
 
     // TODO Set the IP Address of the machine running Docker with Mosquitto image - 192.168.1.180
     let remote_endpoint = (Ipv4Address::new(192, 168, 1, 184), 1883);
-    info!("connecting...");
+    info!("MQTT :: connecting...");
     let connection = socket.connect(remote_endpoint).await;
     if let Err(e) = connection {
-        error!("connect error: {:?}", e);
+        error!("MQTT :: connect error: {:?}", e);
     }
-    info!("connected!");
+    info!("MQTT :: connected!");
 
     let mut config = ClientConfig::new(
         rust_mqtt::client::client_config::MqttVersion::MQTTv5,
@@ -143,13 +143,6 @@ async fn main(spawner: Spawner) {
 
     let mut adc = Adc::new(p.ADC, Irqs, embassy_rp::adc::Config::default());
     let mut ts = embassy_rp::adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
-    fn convert_to_celsius(raw_temp: u16) -> f32 {
-        // According to chapter 4.9.5. Temperature Sensor in RP2040 datasheet
-        let temp = 27.0 - (raw_temp as f32 * 3.3 / 4096.0 - 0.706) / 0.001721;
-        let sign = if temp < 0.0 { -1.0 } else { 1.0 };
-        let rounded_temp_x10: i16 = ((temp * 10.0) + 0.5 * sign) as i16;
-        (rounded_temp_x10 as f32) / 10.0
-    }
 
     let signing_key = get_ecc_p256_signing_key_from_der();
 
@@ -165,36 +158,6 @@ async fn main(spawner: Spawner) {
             error!("Failed to write to the MQTT string!");
             continue;
         }
-
-        fn sign_message(signature: &[u8], message: &[u8]) -> Vec<u8, 512> {
-            let mqtt_message_delimiter = b"####";
-            let mut combined_message: Vec<u8, 512> = Vec::new();
-        
-            info!("sign_message :: Signature: {:?}", signature);
-            info!("sign_message :: Message delimiter: {:?}", mqtt_message_delimiter);
-            info!("sign_message :: Message: {:?}", message);
-            
-            combined_message.extend_from_slice(signature);
-            info!("sign_message :: Combined message after adding signature: {:?}", combined_message);
-            
-            combined_message.extend_from_slice(mqtt_message_delimiter);
-            info!("sign_message :: Combined message after adding delimiter: {:?}", combined_message);
-            
-            combined_message.extend_from_slice(message);
-            info!("sign_message :: Combined message after adding message: {:?}", combined_message);
-            
-            combined_message
-        }
-
-        let mut hasher = Blake2s256::new();
-        hasher.update(message_data.as_bytes());
-        let hashed_message = hasher.finalize();
-
-        let hex_string_from_message_hash = convert_hash_to_hex_string(hashed_message.as_slice());
-
-        info!("Blake2 Hash from: {}", &message_data); 
-        info!("Blake2 Hash bytes: {}", hashed_message.as_slice());
-        info!("Blake2 Hash hex string: {}", &hex_string_from_message_hash);
 
         // Message 1: Raw Temperature without ECC or Blake2 Hashing
 
@@ -217,7 +180,15 @@ async fn main(spawner: Spawner) {
 
         // Message 2: Raw Temperature with Blake2 Hash
 
-        let mqtt_hashed_raw_message = sign_message(&hex_string_from_message_hash.as_bytes(), &message_data.as_bytes());
+        let overhead_start = Instant::now();
+
+        let hex_string_from_message_hash = hash_message_blake2(&message_data);
+
+        let overhead_end = Instant::now();
+        let duration_ms: String<16> = duration_to_bytes(overhead_start, overhead_end);
+
+        let mqtt_hashed_raw_message = sign_message(&hex_string_from_message_hash.as_bytes(), &message_data.as_bytes(), &duration_ms);
+
         let mqtt_hashed_raw_message_slice: &[u8] = mqtt_hashed_raw_message.as_slice();
 
         info!("Message 2: Raw MQTT Message {:?}", &message_data);
@@ -240,10 +211,15 @@ async fn main(spawner: Spawner) {
 
         // Message 3: Raw Temperature with ECC Signature generated from raw message text (unhashed)
 
+        let overhead_start = Instant::now();
+
         let (r_bytes, s_bytes) = generate_signature(&signing_key, &message_data.as_bytes());
         let hex_string_from_signature = convert_signature_to_hex_string(&r_bytes, &s_bytes);
 
-        let mqtt_signed_raw_message = sign_message(&hex_string_from_signature.as_bytes(), &message_data.as_bytes());
+        let overhead_end = Instant::now();
+        let duration_ms: String<16> = duration_to_bytes(overhead_start, overhead_end);
+
+        let mqtt_signed_raw_message = sign_message(&hex_string_from_signature.as_bytes(), &message_data.as_bytes(), &duration_ms);
         let mqtt_signed_raw_message_slice: &[u8] = mqtt_signed_raw_message.as_slice();
 
         info!("Message 3: Raw MQTT Message {:?}", &message_data);
@@ -267,10 +243,17 @@ async fn main(spawner: Spawner) {
 
         // Message 4: Raw Temperature with ECC Signature generated after Blake2 hashing of raw message
 
+        let overhead_start = Instant::now();
+
+        let hex_string_from_message_hash = hash_message_blake2(&message_data);
+
         let (r_bytes, s_bytes) = generate_signature(&signing_key, &hex_string_from_message_hash.as_bytes());
         let hex_string_from_signature = convert_signature_to_hex_string(&r_bytes, &s_bytes);
 
-        let mqtt_signed_hashed_raw_message = sign_message(&hex_string_from_signature.as_bytes(), &message_data.as_bytes());
+        let overhead_end = Instant::now();
+        let duration_ms: String<16> = duration_to_bytes(overhead_start, overhead_end);
+
+        let mqtt_signed_hashed_raw_message = sign_message(&hex_string_from_signature.as_bytes(), &message_data.as_bytes(), &duration_ms);
         let mqtt_signed_hashed_message_slice: &[u8] = mqtt_signed_hashed_raw_message.as_slice();
 
         info!("Message 4: Raw MQTT Message {:?}", &message_data);
@@ -295,54 +278,54 @@ async fn main(spawner: Spawner) {
 
 fn handle_mqtt_error(mqtt_error: ReasonCode) {
     match mqtt_error {
-        ReasonCode::Success => println!("Operation was successful!"),
-        ReasonCode::GrantedQoS1 => println!("Granted QoS level 1!"),
-        ReasonCode::GrantedQoS2 => println!("Granted QoS level 2!"),
-        ReasonCode::DisconnectWithWillMessage => println!("Disconnected with Will message!"),
-        ReasonCode::NoMatchingSubscribers => println!("No matching subscribers on broker!"),
-        ReasonCode::NoSubscriptionExisted => println!("Subscription not exist!"),
-        ReasonCode::ContinueAuth => println!("Broker asks for more AUTH packets!"),
-        ReasonCode::ReAuthenticate => println!("Broker requires re-authentication!"),
-        ReasonCode::UnspecifiedError => println!("Unspecified error!"),
-        ReasonCode::MalformedPacket => println!("Malformed packet sent!"),
-        ReasonCode::ProtocolError => println!("Protocol specific error!"),
-        ReasonCode::ImplementationSpecificError => println!("Implementation specific error!"),
-        ReasonCode::UnsupportedProtocolVersion => println!("Unsupported protocol version!"),
-        ReasonCode::ClientIdNotValid => println!("Client sent not valid identification"),
+        ReasonCode::Success => info!("Operation was successful!"),
+        ReasonCode::GrantedQoS1 => info!("Granted QoS level 1!"),
+        ReasonCode::GrantedQoS2 => info!("Granted QoS level 2!"),
+        ReasonCode::DisconnectWithWillMessage => info!("Disconnected with Will message!"),
+        ReasonCode::NoMatchingSubscribers => info!("No matching subscribers on broker!"),
+        ReasonCode::NoSubscriptionExisted => info!("Subscription not exist!"),
+        ReasonCode::ContinueAuth => info!("Broker asks for more AUTH packets!"),
+        ReasonCode::ReAuthenticate => info!("Broker requires re-authentication!"),
+        ReasonCode::UnspecifiedError => info!("Unspecified error!"),
+        ReasonCode::MalformedPacket => info!("Malformed packet sent!"),
+        ReasonCode::ProtocolError => info!("Protocol specific error!"),
+        ReasonCode::ImplementationSpecificError => info!("Implementation specific error!"),
+        ReasonCode::UnsupportedProtocolVersion => info!("Unsupported protocol version!"),
+        ReasonCode::ClientIdNotValid => info!("Client sent not valid identification"),
         ReasonCode::BadUserNameOrPassword => {
-            println!("Authentication error, username of password not valid!")
+            info!("Authentication error, username of password not valid!")
         }
-        ReasonCode::NotAuthorized => println!("Client not authorized!"),
-        ReasonCode::ServerUnavailable => println!("Server unavailable!"),
-        ReasonCode::ServerBusy => println!("Server is busy!"),
-        ReasonCode::Banned => println!("Client is banned on broker!"),
-        ReasonCode::ServerShuttingDown => println!("Server is shutting down!"),
-        ReasonCode::BadAuthMethod => println!("Provided bad authentication method!"),
-        ReasonCode::KeepAliveTimeout => println!("Client reached timeout"),
-        ReasonCode::SessionTakeOver => println!("Took over session!"),
-        ReasonCode::TopicFilterInvalid => println!("Topic filter is not valid!"),
-        ReasonCode::TopicNameInvalid => println!("Topic name is not valid!"),
-        ReasonCode::PacketIdentifierInUse => println!("Packet identifier is already in use!"),
-        ReasonCode::PacketIdentifierNotFound => println!("Packet identifier not found!"),
-        ReasonCode::ReceiveMaximumExceeded => println!("Maximum receive amount exceeded!"),
-        ReasonCode::TopicAliasInvalid => println!("Invalid topic alias!"),
-        ReasonCode::PacketTooLarge => println!("Sent packet was too large!"),
-        ReasonCode::MessageRateTooHigh => println!("Message rate is too high!"),
-        ReasonCode::QuotaExceeded => println!("Quota exceeded!"),
-        ReasonCode::AdministrativeAction => println!("Administrative action!"),
-        ReasonCode::PayloadFormatInvalid => println!("Invalid payload format!"),
-        ReasonCode::RetainNotSupported => println!("Message retain not supported!"),
-        ReasonCode::QoSNotSupported => println!("Used QoS is not supported!"),
-        ReasonCode::UseAnotherServer => println!("Use another server!"),
-        ReasonCode::ServerMoved => println!("Server moved!"),
-        ReasonCode::SharedSubscriptionNotSupported => println!("Shared subscription is not supported"),
-        ReasonCode::ConnectionRateExceeded => println!("Connection rate exceeded!"),
-        ReasonCode::MaximumConnectTime => println!("Maximum connect time exceeded!"),
-        ReasonCode::SubscriptionIdentifiersNotSupported => println!("Subscription identifier not supported!"),
-        ReasonCode::WildcardSubscriptionNotSupported => println!("Wildcard subscription not supported!"),
-        ReasonCode::TimerNotSupported => println!("Timer implementation is not provided"),
-        ReasonCode::BuffError => println!("Error encountered during write / read from packet"),
-        ReasonCode::NetworkError => println!("Unknown error!"),
+        ReasonCode::NotAuthorized => info!("Client not authorized!"),
+        ReasonCode::ServerUnavailable => info!("Server unavailable!"),
+        ReasonCode::ServerBusy => info!("Server is busy!"),
+        ReasonCode::Banned => info!("Client is banned on broker!"),
+        ReasonCode::ServerShuttingDown => info!("Server is shutting down!"),
+        ReasonCode::BadAuthMethod => info!("Provided bad authentication method!"),
+        ReasonCode::KeepAliveTimeout => info!("Client reached timeout"),
+        ReasonCode::SessionTakeOver => info!("Took over session!"),
+        ReasonCode::TopicFilterInvalid => info!("Topic filter is not valid!"),
+        ReasonCode::TopicNameInvalid => info!("Topic name is not valid!"),
+        ReasonCode::PacketIdentifierInUse => info!("Packet identifier is already in use!"),
+        ReasonCode::PacketIdentifierNotFound => info!("Packet identifier not found!"),
+        ReasonCode::ReceiveMaximumExceeded => info!("Maximum receive amount exceeded!"),
+        ReasonCode::TopicAliasInvalid => info!("Invalid topic alias!"),
+        ReasonCode::PacketTooLarge => info!("Sent packet was too large!"),
+        ReasonCode::MessageRateTooHigh => info!("Message rate is too high!"),
+        ReasonCode::QuotaExceeded => info!("Quota exceeded!"),
+        ReasonCode::AdministrativeAction => info!("Administrative action!"),
+        ReasonCode::PayloadFormatInvalid => info!("Invalid payload format!"),
+        ReasonCode::RetainNotSupported => info!("Message retain not supported!"),
+        ReasonCode::QoSNotSupported => info!("Used QoS is not supported!"),
+        ReasonCode::UseAnotherServer => info!("Use another server!"),
+        ReasonCode::ServerMoved => info!("Server moved!"),
+        ReasonCode::SharedSubscriptionNotSupported => info!("Shared subscription is not supported"),
+        ReasonCode::ConnectionRateExceeded => info!("Connection rate exceeded!"),
+        ReasonCode::MaximumConnectTime => info!("Maximum connect time exceeded!"),
+        ReasonCode::SubscriptionIdentifiersNotSupported => info!("Subscription identifier not supported!"),
+        ReasonCode::WildcardSubscriptionNotSupported => info!("Wildcard subscription not supported!"),
+        ReasonCode::TimerNotSupported => info!("Timer implementation is not provided"),
+        ReasonCode::BuffError => info!("Error encountered during write / read from packet"),
+        ReasonCode::NetworkError => info!("Unknown error!"),
     }
 }
 
@@ -423,4 +406,68 @@ fn convert_signature_to_hex_string(r_bytes: &[u8; 32], s_bytes: &[u8; 32]) -> he
     hex_string_from_signature.push_str(s_hex_str).unwrap();
     
     hex_string_from_signature
+}
+
+fn convert_to_celsius(raw_temp: u16) -> f32 {
+    // According to chapter 4.9.5. Temperature Sensor in RP2040 datasheet
+    let temp = 27.0 - (raw_temp as f32 * 3.3 / 4096.0 - 0.706) / 0.001721;
+    let sign = if temp < 0.0 { -1.0 } else { 1.0 };
+    let rounded_temp_x10: i16 = ((temp * 10.0) + 0.5 * sign) as i16;
+    (rounded_temp_x10 as f32) / 10.0
+}
+
+fn hash_message_blake2(message_data: &String::<50>) -> heapless::String<HEX_STRING_CAPACITY_64> {
+    let mut hasher = Blake2s256::new();
+    hasher.update(message_data.as_bytes());
+    let hashed_message = hasher.finalize();
+
+    let hex_string_from_message_hash = convert_hash_to_hex_string(hashed_message.as_slice());
+
+    info!("Blake2 Hash from: {}", &message_data); 
+    info!("Blake2 Hash bytes: {}", hashed_message.as_slice());
+    info!("Blake2 Hash hex string: {}", &hex_string_from_message_hash);
+
+    hex_string_from_message_hash
+}
+
+fn duration_to_bytes(start: Instant, end: Instant) -> String<16> {
+    let duration_ticks = end.duration_since(start).as_ticks();
+    let duration_ms = (duration_ticks * 1000) / TICK_HZ;
+    info!("Calculated overhead: {} ms", &duration_ms); 
+
+    let mut duration_str = String::<16>::new();
+    if let Ok(_) = core::fmt::write(&mut duration_str, format_args!("{}", &duration_ms)) {
+        info!("Calculated overhead as string: {}", &duration_str);
+    } else {
+        error!("Failed to write to the duration as string!");
+    }
+
+    duration_str
+}
+
+fn sign_message(signature: &[u8], message: &[u8], duration_ms: &String<16>) -> Vec<u8, 512> {
+    let mqtt_message_delimiter = b"####";
+    let mut combined_message: Vec<u8, 512> = Vec::new();
+
+    info!("sign_message :: Signature: {:?}", signature);
+    info!("sign_message :: Message delimiter: {:?}", mqtt_message_delimiter);
+    info!("sign_message :: Message: {:?}", message);
+    info!("sign_message :: Duration (ms): {:?}", duration_ms);
+    
+    combined_message.extend_from_slice(signature);
+    info!("sign_message :: Combined message after adding signature: {:?}", combined_message);
+    
+    combined_message.extend_from_slice(mqtt_message_delimiter);
+    info!("sign_message :: Combined message after adding delimiter: {:?}", combined_message);
+    
+    combined_message.extend_from_slice(message);
+    info!("sign_message :: Combined message after adding message: {:?}", combined_message);
+
+    combined_message.extend_from_slice(mqtt_message_delimiter);
+    info!("sign_message :: Combined message after adding delimiter: {:?}", combined_message);
+    
+    combined_message.extend_from_slice(duration_ms.as_bytes());
+    info!("sign_message :: Combined message after adding duration: {:?}", combined_message);
+    
+    combined_message
 }
