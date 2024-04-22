@@ -113,10 +113,12 @@ async fn main(spawner: Spawner) {
     let mut tx_buffer = [0; 4096];
 
     let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-    socket.set_timeout(Some(Duration::from_secs(10)));
+    socket.set_timeout(Some(Duration::from_secs(30)));
 
     // TODO Set the IP Address of the machine running Docker with Mosquitto image - 192.168.1.180
-    let remote_endpoint = (Ipv4Address::new(192, 168, 1, 184), 1883);
+    let remote_endpoint = (Ipv4Address::new(192, 168, 1, 184), 8883);
+    // let remote_endpoint = (Ipv4Address::new(192, 168, 1, 180), 1883);
+
     info!("MQTT :: connecting...");
     let connection = socket.connect(remote_endpoint).await;
     if let Err(e) = connection {
@@ -130,6 +132,7 @@ async fn main(spawner: Spawner) {
     );
     config.add_max_subscribe_qos(rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1);
     config.add_client_id("clientId-pi-pico-w");
+    config.keep_alive = 3000;
     config.max_packet_size = 300;
     let mut recv_buffer = [0; 300];
     let mut write_buffer = [0; 300];
@@ -151,6 +154,8 @@ async fn main(spawner: Spawner) {
         let temp_celsius = convert_to_celsius(temp);
         info!("Temp: {} degrees", &temp_celsius);
 
+        // Message 1: Raw Temperature without ECC or Blake2 Hashing
+
         let mut message_data = String::<50>::new();
         if let Ok(_) = core::fmt::write(&mut message_data, format_args!("Reactor Core Temperature :: {:.1} °C", &temp_celsius)) {
             info!("Raw message to MQTT: {}", message_data);            
@@ -158,8 +163,6 @@ async fn main(spawner: Spawner) {
             error!("Failed to write to the MQTT string!");
             continue;
         }
-
-        // Message 1: Raw Temperature without ECC or Blake2 Hashing
 
         info!("Message 1: Raw MQTT Message {:?}", &message_data);
 
@@ -179,6 +182,14 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(1000)).await;
 
         // Message 2: Raw Temperature with Blake2 Hash
+
+        let mut message_data = String::<50>::new();
+        if let Ok(_) = core::fmt::write(&mut message_data, format_args!("Reactor Core Temperature :: {:.1} °C", &temp_celsius + 1.0)) {
+            info!("Raw message to MQTT: {}", message_data);            
+        } else {
+            error!("Failed to write to the MQTT string!");
+            continue;
+        }
 
         let overhead_start = Instant::now();
 
@@ -211,6 +222,14 @@ async fn main(spawner: Spawner) {
 
         // Message 3: Raw Temperature with ECC Signature generated from raw message text (unhashed)
 
+        let mut message_data = String::<50>::new();
+        if let Ok(_) = core::fmt::write(&mut message_data, format_args!("Reactor Core Temperature :: {:.1} °C", &temp_celsius - 1.0)) {
+            info!("Raw message to MQTT: {}", message_data);            
+        } else {
+            error!("Failed to write to the MQTT string!");
+            continue;
+        }
+
         let overhead_start = Instant::now();
 
         let (r_bytes, s_bytes) = generate_signature(&signing_key, &message_data.as_bytes());
@@ -242,6 +261,14 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(1000)).await;
 
         // Message 4: Raw Temperature with ECC Signature generated after Blake2 hashing of raw message
+
+        let mut message_data = String::<50>::new();
+        if let Ok(_) = core::fmt::write(&mut message_data, format_args!("Reactor Core Temperature :: {:.1} °C", &temp_celsius + 2.0)) {
+            info!("Raw message to MQTT: {}", message_data);            
+        } else {
+            error!("Failed to write to the MQTT string!");
+            continue;
+        }
 
         let overhead_start = Instant::now();
 
