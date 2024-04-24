@@ -116,8 +116,9 @@ async fn main(spawner: Spawner) {
     socket.set_timeout(Some(Duration::from_secs(30)));
 
     // TODO Set the IP Address of the machine running Docker with Mosquitto image - 192.168.1.180
-    let remote_endpoint = (Ipv4Address::new(192, 168, 1, 184), 8883);
-    // let remote_endpoint = (Ipv4Address::new(192, 168, 1, 180), 1883);
+    // let remote_endpoint = (Ipv4Address::new(192, 168, 0, 100), 8883);
+    let remote_endpoint = (Ipv4Address::new(192, 168, 0, 100), 1883);
+    // let remote_endpoint = (Ipv4Address::new(192, 168, 1, 180), 1883);10.0.7.214
 
     info!("MQTT :: connecting...");
     let connection = socket.connect(remote_endpoint).await;
@@ -141,7 +142,21 @@ async fn main(spawner: Spawner) {
 
     match client.connect_to_broker().await {
         Ok(()) => {}
-        Err(mqtt_error) => handle_mqtt_error(mqtt_error),
+        Err(mqtt_error) => {
+            handle_mqtt_error_by_type(&mqtt_error);
+    
+            if mqtt_error == ReasonCode::NetworkError {
+                info!("Attempting MQTT reconnect from initial connection.");
+                Timer::after(Duration::from_millis(1000)).await;
+                client.disconnect();
+                Timer::after(Duration::from_millis(1000)).await;
+                
+                match client.connect_to_broker().await {
+                    Ok(()) => {},
+                    Err(new_error) => handle_mqtt_error_by_type(&new_error),
+                }
+            }
+        }
     }
 
     let mut adc = Adc::new(p.ADC, Irqs, embassy_rp::adc::Config::default());
@@ -176,7 +191,7 @@ async fn main(spawner: Spawner) {
         .await
         {
             Ok(()) => {}
-            Err(mqtt_error) => handle_mqtt_error(mqtt_error),
+            Err(mqtt_error) => handle_mqtt_error_by_type(&mqtt_error),
         }
 
         Timer::after(Duration::from_millis(1000)).await;
@@ -215,7 +230,7 @@ async fn main(spawner: Spawner) {
         .await
         {
             Ok(()) => {}
-            Err(mqtt_error) => handle_mqtt_error(mqtt_error),
+            Err(mqtt_error) => handle_mqtt_error_by_type(&mqtt_error),
         }
 
         Timer::after(Duration::from_millis(1000)).await;
@@ -255,7 +270,7 @@ async fn main(spawner: Spawner) {
             .await
         {
             Ok(()) => {}
-            Err(mqtt_error) => handle_mqtt_error(mqtt_error),
+            Err(mqtt_error) => handle_mqtt_error_by_type(&mqtt_error),
         }
 
         Timer::after(Duration::from_millis(1000)).await;
@@ -296,14 +311,14 @@ async fn main(spawner: Spawner) {
             .await
         {
             Ok(()) => {}
-            Err(mqtt_error) => handle_mqtt_error(mqtt_error),
+            Err(mqtt_error) => handle_mqtt_error_by_type(&mqtt_error),
         }
         
         Timer::after(Duration::from_millis(3000)).await;
     }
 }
 
-fn handle_mqtt_error(mqtt_error: ReasonCode) {
+fn handle_mqtt_error_by_type(mqtt_error: &ReasonCode) {
     match mqtt_error {
         ReasonCode::Success => info!("Operation was successful!"),
         ReasonCode::GrantedQoS1 => info!("Granted QoS level 1!"),
